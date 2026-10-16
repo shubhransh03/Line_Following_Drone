@@ -1,0 +1,43 @@
+All the necessary Hardware components required: -
+
+1. Frame & Propulsion System
+
+S500 quadcopter frame.
+Brushless Motors(4).
+ESC(4).
+Propellers.
+Landing Gears.
+Power Distribution Board.
+Battery(recommended - 3300 mah approx.).
+
+2. Flight Controller
+
+Pixhawk Flight Controller.
+Built-in MS5611 barometer.
+
+3. Raspberry Pi Camera Module V4
+
+4. RC Transmitter + Receiver(for communication)
+
+5. Jumper Wires
+
+6. Software - Qgroundcontrol for motor caliberation
+
+
+
+All the necessary libraries and packages required for line detection robot: -
+
+1. Installation of python3 - OpenCV for vision.
+
+2. Installation of dronekit.
+
+3. Installation of pymavlink.
+
+4. Installation of future.
+
+5. Installation of v41-utils.
+
+6. Installation of gstreamer.
+
+7. Installation of pyserial.
+

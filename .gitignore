@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+drone_env/
+venv/
+env/
+.env
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

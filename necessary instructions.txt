@@ -1,0 +1,100 @@
+All the necessary instructions to run the codes: -
+
+=======================================
+INITIAL SETUP
+=======================================
+
+1. sudo apt update
+   (update the current version of the terminal in raspberry pi for updated libraries)
+
+2. sudo apt upgrade
+
+3. sudo apt install python3-opencv
+   (install OpenCV for computer vision)
+
+4. sudo apt install python3-venv -y
+   (install Python virtual environment support)
+
+5. python3 -m venv drone_env
+   (create virtual environment for drone packages)
+
+6. source drone_env/bin/activate
+   (activate the virtual environment)
+
+7. pip install dronekit pymavlink pyserial future
+   (install all Python dependencies at once)
+
+8. sudo apt install v4l-utils -y
+   (install Video4Linux utilities)
+
+9. sudo apt install gstreamer1.0-tools \
+   gstreamer1.0-plugins-base \
+   gstreamer1.0-plugins-good \
+   gstreamer1.0-plugins-bad -y
+   (install GStreamer for camera pipeline)
+
+10. sudo usermod -a -G dialout $USER
+    (grant serial port access for Pixhawk communication)
+
+11. sudo reboot
+    (restart the raspberry pi for proper working of camera and serial)
+
+=======================================
+TESTING INDIVIDUAL COMPONENTS
+=======================================
+
+12. source drone_env/bin/activate
+    (activate virtual environment after reboot)
+
+13. python cam_test.py
+    (test camera feed — press ESC to exit)
+
+14. python drone_test.py
+    (test Pixhawk connection — shows battery, GPS, mode, etc.)
+
+15. python line_detection.py
+    (test line detection — point at a dark line, press ESC to exit)
+
+=======================================
+RUNNING THE DRONE
+=======================================
+
+16. python main.py --no-fly
+    (vision-only mode — test line detection + PID without flying)
+
+17. python main.py
+    (FULL AUTONOMOUS FLIGHT — ensure safe open area, RC transmitter ready!)
+
+=======================================
+TROUBLESHOOTING
+=======================================
+
+18. libcamera-hello
+    (test if camera is detected by the system)
+
+19. rpicam-hello --timeout 0
+    (alternative camera test for newer Raspberry Pi OS)
+
+20. v4l2-ctl --list-devices
+    (list available video devices)
+
+21. vcgencmd get_camera
+    (check camera status)
+
+22. ls /dev/serial*
+    (check if Pixhawk serial port is available)
+
+23. sudo raspi-config
+    (configure Raspberry Pi settings — enable serial, camera, etc.)
+
+24. pip install dronekit-sitl
+    (optional — install DroneKit simulator for testing without hardware)
+
+=======================================
+CONFIGURATION
+=======================================
+
+All tunable parameters (PID gains, altitude, speed, thresholds, safety
+limits) are in config.py. Edit that file to tune the drone's behaviour.
+
+See README.md for the full PID tuning guide.

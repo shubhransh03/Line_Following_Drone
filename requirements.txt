@@ -1,0 +1,13 @@
+# Line Following Drone - Python Dependencies
+#
+# Install with: pip install -r requirements.txt
+#
+# Note: On Raspberry Pi, opencv is installed via apt (python3-opencv)
+# rather than pip. Use this file for development/IDE support.
+
+opencv-python>=4.8.0
+dronekit>=2.9.2
+pymavlink>=2.4.0
+pyserial>=3.5
+future>=0.18.0
+numpy>=1.24.0
