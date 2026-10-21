@@ -1,0 +1,124 @@
+# ==============================================================================
+# Autonomous Line-Following Drone — Raspberry Pi Configuration
+# ==============================================================================
+# IMPORTANT: Unknown hardware settings are intentionally set to null (unconfigured).
+# The software will refuse to start in 'hardware' mode until these settings are
+# explicitly configured for your physical vehicle setup.
+# ==============================================================================
+
+# Operating Mode:
+#   - 'diagnostics': Read-only inspection of sensors and telemetry (no flight commands).
+#   - 'mock': Offline autonomous simulation with synthetic camera & mock MAVLink.
+#   - 'hardware': Live flight mode (STRICTLY GUARDED; requires physical hardware configuration).
+# DEFAULT IS NEVER 'hardware'.
+mode: "diagnostics"
+
+# ==============================================================================
+# Flight Controller Telemetry (Pixhawk <-> Raspberry Pi)
+# ==============================================================================
+telemetry:
+  # Connection type: 'uart' (GPIO pins 14/15), 'usb' (/dev/ttyACM0), or 'mock'
+  connection_type: "uart"
+  
+  # Physical serial port endpoint (MUST be configured when hardware is connected)
+  # Examples:
+  #   - Raspberry Pi GPIO UART: "/dev/ttyAMA0" or "/dev/serial0"
+  #   - USB-to-Pixhawk cable: "/dev/ttyACM0" or "/dev/ttyUSB0"
+  port: null
+  
+  # Telemetry Baud Rate (default ArduPilot TELEM2 baud is typically 57600 or 921600)
+  baud_rate: 57600
+  
+  # Timeouts (seconds)
+  heartbeat_timeout: 3.0
+  connect_timeout: 30.0
+
+# ==============================================================================
+# Camera Acquisition
+# ==============================================================================
+camera:
+  # Source type: 'csi' (Raspberry Pi Camera Module via libcamera), 'usb' (V4L2),
+  #              'gstreamer', or 'synthetic' (for mock/offline testing)
+  source_type: null
+  
+  # Device index or device path (e.g. 0, "/dev/video0", or libcamera GStreamer pipeline)
+  device_index: null
+  
+  # Frame dimensions
+  width: 640
+  height: 480
+  fps: 30
+  
+  # Camera failure bounds (seconds)
+  frame_timeout: 1.0          # Seconds without valid frame before zero-velocity hover
+  fault_timeout: 3.0          # Seconds without valid frame before aborting flight
+  max_consecutive_failures: 10 # Dropped reads threshold before warning
+  retry_sleep_sec: 0.05       # Backoff sleep on frame drop
+
+# ==============================================================================
+# Vision & Line Perception
+# ==============================================================================
+vision:
+  threshold_value: 60         # Grayscale cutoff (0-255) for line mask
+  blur_kernel_size: 5         # Gaussian blur kernel size (odd integer >= 3)
+  min_contour_area: 500       # Minimum contour area in px^2 to reject noise
+  invert_threshold: true      # True = dark line on light floor; False = bright line
+  
+  # Dual-Region-of-Interest (ROI) bands (fractions of frame height)
+  near_roi_bottom_pct: 0.30   # Bottom 30% band for primary lateral deviation
+  far_roi_top_pct: 0.30       # Top 30% band for forward lookahead heading
+
+# ==============================================================================
+# Guidance & Control (PID)
+# ==============================================================================
+guidance:
+  # Lateral velocity PID gains (tune conservatively)
+  kp: 0.3
+  ki: 0.0
+  kd: 0.1
+  integral_limit: 50.0        # Anti-windup clamp
+  
+  # Velocity bounds (m/s)
+  max_lateral_speed: 0.5      # Maximum lateral correction speed
+  forward_speed: 0.3          # Nominal forward speed along track
+  
+  # Altitude setpoint (meters)
+  target_altitude: 2.0
+  takeoff_timeout: 30.0
+  
+  # Guidance loop update rate (Hz)
+  loop_rate_hz: 10.0
+
+# ==============================================================================
+# Safety & Failsafe Parameters
+# ==============================================================================
+safety:
+  # Battery Monitor (LiPo)
+  battery:
+    # Cell count: 3 (for 3S LiPo ~11.1V nominal) or 4 (for 4S LiPo ~14.8V nominal)
+    # MUST be configured based on physical battery
+    cell_count: null
+    
+    # Critical low-voltage landing threshold (Volts)
+    # (e.g., 10.5V for 3S LiPo; 14.0V for 4S LiPo)
+    low_voltage: null
+    
+    min_valid_voltage: 5.0    # Reject readings below 5V (disconnected sensor)
+    max_valid_voltage: 26.0   # Reject readings above 26V (6S upper bound)
+    stale_timeout: 3.0        # Seconds without update before battery marked STALE
+    consecutive_low_required: 3 # Samples required to confirm LOW state
+    hysteresis: 0.3           # Voltage margin above threshold to recover to NORMAL
+    recovery_count: 3         # Healthy samples needed to clear LOW state
+    
+  # Line Loss Watchdog
+  line_lost_timeout: 3.0      # Seconds without line detection before abort
+  
+  # Landing
+  landing_timeout: 60.0       # Seconds to wait for touchdown and disarm
+  
+  # RC Transmitter Manual Override
+  rc_override:
+    # RC channel monitored for pilot switch (e.g. Channel 5 or 6)
+    channel: null             # Unverified until pilot radio calibration
+    pwm_threshold: 1800       # PWM above threshold signals manual pilot takeover
+    enabled: false            # Guarded until radio calibration is confirmed

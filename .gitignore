@@ -8,6 +8,9 @@ drone_env/
 venv/
 env/
 .env
+.venv/
+.diag_venv/
+*.venv/
 
 # macOS
 .DS_Store

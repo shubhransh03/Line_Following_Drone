@@ -18,10 +18,17 @@ import collections.abc
 if not hasattr(collections, "MutableMapping"):
     collections.MutableMapping = collections.abc.MutableMapping
 
-from dronekit import connect, VehicleMode
+try:
+    from dronekit import connect, VehicleMode
+    DRONEKIT_AVAILABLE = True
+except ImportError:
+    connect = None
+    VehicleMode = None
+    DRONEKIT_AVAILABLE = False
 from pymavlink import mavutil
 
 import config
+from battery_monitor import BatteryMonitor, BatteryState
 
 
 class FlightController:
@@ -29,9 +36,14 @@ class FlightController:
     High-level interface to the Pixhawk flight controller via DroneKit.
     """
 
-    def __init__(self):
+    def __init__(self, battery_monitor=None):
         self.vehicle = None
         self._connected = False
+        self.last_takeoff_status = None
+        self.last_landing_status = None
+        self.last_prearm_issues = []
+        self.last_prearm_missing = []
+        self.battery_monitor = battery_monitor if battery_monitor is not None else BatteryMonitor()
 
     # ------------------------------------------------------------------
     # Connection
@@ -52,6 +64,11 @@ class FlightController:
         port = port or config.SERIAL_PORT
         baud = baud or config.BAUD_RATE
         timeout = timeout or config.CONNECT_TIMEOUT
+
+        if not DRONEKIT_AVAILABLE:
+            print("[FC] ERROR: dronekit is not installed. Install dronekit for physical flight connection.")
+            self._connected = False
+            return False
 
         print(f"[FC] Connecting to Pixhawk on {port} at {baud} baud...")
 
@@ -107,6 +124,7 @@ class FlightController:
         return {
             'battery_voltage': v.battery.voltage,
             'battery_level': v.battery.level,
+            'battery_state': self.battery_monitor.state,
             'gps_fix': v.gps_0.fix_type,
             'gps_num_sat': v.gps_0.satellites_visible,
             'mode': v.mode.name,
@@ -117,68 +135,168 @@ class FlightController:
         }
 
     # ------------------------------------------------------------------
+    # Pre-Arm Health Checks
+    # ------------------------------------------------------------------
+
+    def check_prearm_health(self):
+        """
+        Evaluate pre-arm sensor and telemetry health indicators.
+
+        Returns:
+            Tuple of (is_healthy: bool, issues: list of str, missing_telemetry: list of str)
+        """
+        issues = []
+        missing = []
+
+        if not self._check_connected():
+            issues.append("Vehicle not connected")
+            return False, issues, missing
+
+        v = self.vehicle
+
+        # 1. Heartbeat freshness
+        last_hb = getattr(v, 'last_heartbeat', None)
+        if last_hb is None:
+            missing.append("Heartbeat telemetry unavailable")
+        elif last_hb > 3.0:
+            issues.append(f"Stale heartbeat: {last_hb:.1f}s since last packet")
+
+        # 2. Must be disarmed initially
+        if getattr(v, 'armed', False):
+            issues.append("Vehicle is already armed prior to takeoff sequence")
+
+        # 3. Autopilot pre-arm check
+        is_armable = getattr(v, 'is_armable', None)
+        if is_armable is None:
+            missing.append("Autopilot is_armable telemetry unavailable")
+        elif not is_armable:
+            issues.append("Autopilot internal pre-arm check failed (is_armable=False)")
+
+        # 4. Battery telemetry
+        batt = getattr(v, 'battery', None)
+        voltage = getattr(batt, 'voltage', None) if batt else None
+        if voltage is None:
+            missing.append("Battery voltage telemetry unavailable")
+        else:
+            is_valid, reason = self.battery_monitor.validate_voltage(voltage)
+            if not is_valid:
+                issues.append(f"Invalid battery telemetry: {reason}")
+            elif voltage < config.LOW_BATTERY_VOLTAGE:
+                issues.append(f"Battery critically low: {voltage:.2f}V (threshold {config.LOW_BATTERY_VOLTAGE}V)")
+            else:
+                self.battery_monitor.update(voltage)
+
+        # 5. Altitude telemetry
+        loc = getattr(v, 'location', None)
+        rel_frame = getattr(loc, 'global_relative_frame', None) if loc else None
+        alt = getattr(rel_frame, 'alt', None) if rel_frame else None
+        if alt is None:
+            missing.append("Relative altitude telemetry unavailable")
+
+        # 6. EKF status (if reported)
+        ekf_ok = getattr(v, 'ekf_ok', None)
+        if ekf_ok is None:
+            missing.append("EKF health telemetry unavailable")
+        elif not ekf_ok:
+            issues.append("Autopilot EKF reporting not healthy (ekf_ok=False)")
+
+        is_healthy = (len(issues) == 0 and len(missing) == 0)
+        self.last_prearm_issues = issues
+        self.last_prearm_missing = missing
+
+        return is_healthy, issues, missing
+
+    # ------------------------------------------------------------------
     # Arm & Takeoff
     # ------------------------------------------------------------------
 
-    def arm_and_takeoff(self, target_altitude=None):
+    def arm_and_takeoff(self, target_altitude=None, timeout=None,
+                         clock_fn=time.monotonic, sleep_fn=time.sleep):
         """
-        Perform pre-arm checks, arm motors, and takeoff to target altitude.
+        Perform pre-arm health checks, arm motors, and takeoff to target altitude with bounded timeout.
 
         Args:
             target_altitude: Altitude in meters (default: config.TARGET_ALTITUDE)
+            timeout: Maximum climb duration in seconds (default: config.TAKEOFF_TIMEOUT)
+            clock_fn: Monotonic clock callable (injectable for testing)
+            sleep_fn: Sleep/polling callable (injectable for testing)
 
         Returns:
-            True if takeoff was successful, False otherwise
+            True if target altitude reached within timeout, False otherwise.
         """
         if not self._check_connected():
+            self.last_takeoff_status = "NOT_CONNECTED"
             return False
 
         target_altitude = target_altitude or config.TARGET_ALTITUDE
+        timeout = timeout or config.TAKEOFF_TIMEOUT
 
-        print("[FC] Running pre-arm checks...")
-        timeout_start = time.time()
-        while not self.vehicle.is_armable:
-            if time.time() - timeout_start > config.CONNECT_TIMEOUT:
-                print("[FC] ERROR: Pre-arm checks timed out!")
-                return False
-            print("[FC]  Waiting for vehicle to initialise...")
-            time.sleep(1)
+        print("[FC] Running pre-arm health checks...")
+        healthy, issues, missing = self.check_prearm_health()
+        if not healthy:
+            print(f"[FC] ERROR: Pre-arm health check failed! Issues: {issues}, Missing: {missing}")
+            self.last_takeoff_status = "PREARM_FAILED"
+            return False
 
         print("[FC] Setting GUIDED mode...")
-        self.vehicle.mode = VehicleMode("GUIDED")
+        if VehicleMode is not None:
+            self.vehicle.mode = VehicleMode("GUIDED")
+        else:
+            self.vehicle.mode = "GUIDED"
 
-        # Wait for mode change
-        timeout_start = time.time()
-        while self.vehicle.mode.name != "GUIDED":
-            if time.time() - timeout_start > 10:
+        # Wait for mode change with bounded timeout (10s)
+        timeout_start = clock_fn()
+        while getattr(self.vehicle.mode, 'name', self.vehicle.mode) != "GUIDED":
+            if clock_fn() - timeout_start > 10.0:
                 print("[FC] ERROR: Failed to switch to GUIDED mode!")
+                self.last_takeoff_status = "MODE_CHANGE_FAILED"
                 return False
-            time.sleep(0.5)
+            sleep_fn(0.5)
 
         print("[FC] Arming motors...")
         self.vehicle.armed = True
 
-        timeout_start = time.time()
+        timeout_start = clock_fn()
         while not self.vehicle.armed:
-            if time.time() - timeout_start > 10:
+            if clock_fn() - timeout_start > 10.0:
                 print("[FC] ERROR: Arming timed out!")
+                self.last_takeoff_status = "ARMING_FAILED"
                 return False
             print("[FC]  Waiting for arming...")
-            time.sleep(1)
+            sleep_fn(1.0)
 
-        print(f"[FC] Taking off to {target_altitude}m...")
+        print(f"[FC] Taking off to {target_altitude}m (timeout: {timeout:.1f}s)...")
         self.vehicle.simple_takeoff(target_altitude)
 
-        # Wait until target altitude is reached
-        while True:
-            current_alt = self.vehicle.location.global_relative_frame.alt
-            print(f"[FC]  Altitude: {current_alt:.1f}m / {target_altitude}m")
+        # Wait until target altitude is reached with bounded timeout
+        climb_start = clock_fn()
+        target_threshold = target_altitude * 0.95
+        altitude_reached = False
 
-            if current_alt >= target_altitude * 0.95:
-                print("[FC] Target altitude reached!")
-                break
-            time.sleep(1)
+        while clock_fn() - climb_start < timeout:
+            loc = getattr(self.vehicle, 'location', None)
+            rel_frame = getattr(loc, 'global_relative_frame', None) if loc else None
+            current_alt = getattr(rel_frame, 'alt', None) if rel_frame else None
 
+            if current_alt is None:
+                print("[FC] WARNING: Altitude telemetry unavailable during climb...")
+            else:
+                print(f"[FC]  Climb Altitude: {current_alt:.1f}m / {target_altitude:.1f}m")
+                if current_alt >= target_threshold:
+                    altitude_reached = True
+                    print("[FC] Target altitude reached successfully!")
+                    break
+
+            sleep_fn(config.TAKEOFF_POLL_INTERVAL)
+
+        if not altitude_reached:
+            elapsed = clock_fn() - climb_start
+            print(f"[FC] ERROR: Takeoff timed out after {elapsed:.1f}s without reaching {target_threshold:.1f}m target!")
+            # Non-actuating fault result: record status and return False without issuing unverified LAND
+            self.last_takeoff_status = "TIMEOUT"
+            return False
+
+        self.last_takeoff_status = "SUCCESS"
         return True
 
     # ------------------------------------------------------------------
@@ -225,21 +343,48 @@ class FlightController:
     # Landing
     # ------------------------------------------------------------------
 
-    def land(self):
-        """Switch to LAND mode and wait for the vehicle to disarm."""
+    def land(self, timeout=None, clock_fn=time.monotonic, sleep_fn=time.sleep):
+        """
+        Switch to LAND mode and wait with bounded timeout for the vehicle to disarm.
+
+        Args:
+            timeout: Maximum seconds to wait for disarm (default: config.LANDING_TIMEOUT)
+            clock_fn: Monotonic clock callable (injectable for testing)
+            sleep_fn: Sleep/polling callable (injectable for testing)
+
+        Returns:
+            True if landed and disarmed within timeout, False otherwise.
+        """
         if not self._check_connected():
-            return
+            self.last_landing_status = "NOT_CONNECTED"
+            return False
 
+        timeout = timeout or config.LANDING_TIMEOUT
         print("[FC] Landing...")
-        self.vehicle.mode = VehicleMode("LAND")
+        if VehicleMode is not None:
+            self.vehicle.mode = VehicleMode("LAND")
+        else:
+            self.vehicle.mode = "LAND"
 
-        # Wait for landing (vehicle disarms when landed)
-        while self.vehicle.armed:
-            current_alt = self.vehicle.location.global_relative_frame.alt
-            print(f"[FC]  Landing... Altitude: {current_alt:.1f}m")
-            time.sleep(1)
+        start_time = clock_fn()
+        # Bounded wait for landing (vehicle disarms when landed)
+        while getattr(self.vehicle, 'armed', False):
+            elapsed = clock_fn() - start_time
+            if elapsed > timeout:
+                print(f"[FC] ERROR: Landing timed out after {elapsed:.1f}s without disarming!")
+                self.last_landing_status = "TIMEOUT"
+                return False
+
+            loc = getattr(self.vehicle, 'location', None)
+            rel_frame = getattr(loc, 'global_relative_frame', None) if loc else None
+            current_alt = getattr(rel_frame, 'alt', None) if rel_frame else None
+            alt_str = f"{current_alt:.1f}m" if current_alt is not None else "unknown"
+            print(f"[FC]  Landing... Altitude: {alt_str} (elapsed: {elapsed:.1f}s)")
+            sleep_fn(1.0)
 
         print("[FC] Landed and disarmed.")
+        self.last_landing_status = "SUCCESS"
+        return True
 
     def return_to_launch(self):
         """Switch to RTL mode."""
@@ -247,27 +392,45 @@ class FlightController:
             return
 
         print("[FC] Returning to launch!")
-        self.vehicle.mode = VehicleMode("RTL")
+        if VehicleMode is not None:
+            self.vehicle.mode = VehicleMode("RTL")
+        else:
+            self.vehicle.mode = "RTL"
 
     # ------------------------------------------------------------------
     # Safety Checks
     # ------------------------------------------------------------------
 
-    def check_battery(self):
+    def check_battery(self, clock_fn=None):
         """
-        Check if battery voltage is above safe threshold.
+        Check if battery voltage is above safe threshold using BatteryMonitor.
+        Guards against stale telemetry link where DroneKit retains cached voltage.
 
         Returns:
-            True if battery is OK, False if critically low
+            True if battery is OK, False if critically low, stale, or link lost
         """
         if not self._check_connected():
             return False
 
-        voltage = self.vehicle.battery.voltage
-        if voltage is not None and voltage < config.LOW_BATTERY_VOLTAGE:
-            print(f"[FC] WARNING: Battery critically low! {voltage:.1f}V")
+        # Link freshness check: if autopilot heartbeat has stopped, cached battery data is invalid
+        last_hb = getattr(self.vehicle, 'last_heartbeat', None)
+        if last_hb is not None and last_hb > config.BATTERY_STALE_TIMEOUT:
+            print(f"[FC] WARNING: Autopilot heartbeat is stale ({last_hb:.1f}s)! Battery data unverified.")
+            self.battery_monitor.update(None)
             return False
-        return True
+
+        batt = getattr(self.vehicle, 'battery', None)
+        voltage = getattr(batt, 'voltage', None) if batt else None
+
+        state = self.battery_monitor.update(voltage)
+        if state == BatteryState.LOW:
+            print(f"[FC] WARNING: Battery critically low! {voltage:.1f}V (consecutive low: {self.battery_monitor.consecutive_low_count})")
+            return False
+        elif state == BatteryState.STALE:
+            print("[FC] WARNING: Battery telemetry is stale!")
+            return False
+
+        return self.battery_monitor.is_ok()
 
     def check_rc_override(self):
         """
@@ -310,6 +473,9 @@ class FlightController:
     def close(self):
         """Cleanly disconnect from the vehicle."""
         if self.vehicle is not None:
+            is_armed = getattr(self.vehicle, 'armed', False)
+            if is_armed:
+                print("[FC] WARNING: Closing telemetry connection while vehicle is still armed!")
             print("[FC] Closing vehicle connection...")
             try:
                 self.vehicle.close()
@@ -317,6 +483,7 @@ class FlightController:
                 print(f"[FC] Warning during close: {e}")
             self.vehicle = None
         self._connected = False
+        self.battery_monitor.reset()
         print("[FC] Disconnected.")
 
     # ------------------------------------------------------------------

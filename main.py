@@ -23,6 +23,7 @@ import signal
 import config
 from pid_controller import PIDController
 from flight_controller import FlightController
+from line_detector import LineDetector
 
 
 # ==============================================================================
@@ -46,9 +47,19 @@ signal.signal(signal.SIGINT, signal_handler)
 # Vision Processing
 # ==============================================================================
 
+# Global detector instance configured from centralized parameters
+_line_detector = LineDetector(
+    threshold_value=config.THRESHOLD_VALUE,
+    blur_kernel_size=config.BLUR_KERNEL_SIZE,
+    min_contour_area=config.MIN_CONTOUR_AREA,
+    invert_threshold=True
+)
+
+
 def detect_line(frame):
     """
     Detect the line in a camera frame and compute lateral error.
+    Delegates to the unified LineDetector implementation.
 
     Args:
         frame: BGR image from camera
@@ -60,41 +71,7 @@ def detect_line(frame):
           - thresh: thresholded binary image for debug display
         Returns (None, None, None, thresh) if no line is detected.
     """
-    # Convert to grayscale and blur to reduce noise
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray,
-                            (config.BLUR_KERNEL_SIZE, config.BLUR_KERNEL_SIZE),
-                            0)
-
-    # Binary threshold — dark line becomes white on black background
-    _, thresh = cv2.threshold(blur, config.THRESHOLD_VALUE, 255,
-                              cv2.THRESH_BINARY_INV)
-
-    # Find contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE,
-                                   cv2.CHAIN_APPROX_NONE)
-
-    if len(contours) > 0:
-        # Filter by minimum area to reject noise
-        valid_contours = [c for c in contours
-                          if cv2.contourArea(c) >= config.MIN_CONTOUR_AREA]
-
-        if valid_contours:
-            # Take the largest valid contour (assumed to be the line)
-            c = max(valid_contours, key=cv2.contourArea)
-            M = cv2.moments(c)
-
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-
-                # Error = how far the line centroid is from frame center
-                frame_center_x = frame.shape[1] // 2
-                error = cx - frame_center_x
-
-                return error, cx, cy, thresh
-
-    return None, None, None, thresh
+    return _line_detector.detect(frame).as_tuple()
 
 
 def draw_debug_overlay(frame, thresh, error, cx, cy, pid_output, line_detected):
@@ -138,8 +115,190 @@ def draw_debug_overlay(frame, thresh, error, cx, cy, pid_output, line_detected):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 
+def _get_battery_failure_cause(fc):
+    """Determine specific battery failure cause and log message from FlightController."""
+    batt_mon = getattr(fc, 'battery_monitor', None)
+    state = getattr(batt_mon, 'state', None)
+    if state == "STALE":
+        return "STALE_BATTERY", "[MAIN] CRITICAL: Battery telemetry stale / link lost! Emergency landing!"
+    elif state == "UNKNOWN":
+        return "UNKNOWN_BATTERY", "[MAIN] CRITICAL: Battery telemetry uninitialized! Emergency landing!"
+    return "LOW_BATTERY", "[MAIN] CRITICAL: Low battery! Emergency landing!"
+
+
 # ==============================================================================
-# Main Flight Loop
+# Flight Control Loop Execution
+# ==============================================================================
+
+def run_flight_loop(cap, detector, pid, fc=None, fly_mode=False,
+                    clock_fn=time.monotonic, sleep_fn=time.sleep,
+                    max_iterations=None, exit_on_override=True):
+    """
+    Core line-following control loop with bounded camera-failure handling.
+
+    Args:
+        cap: Video capture object or mock supporting .read().
+        detector: LineDetector instance.
+        pid: PIDController instance.
+        fc: FlightController instance (or None/mock).
+        fly_mode: Whether live velocity commands and flight safety checks are active.
+        clock_fn: Callable returning monotonic time in seconds (injectable for testing).
+        sleep_fn: Callable for sleep/pacing (injectable for testing).
+        max_iterations: Bounded iteration count for tests (None = run until shutdown).
+        exit_on_override: If True, calls sys.exit(0) on pilot override; if False, returns.
+
+    Returns:
+        Dict summarizing loop execution (loop_count, consecutive_frame_failures, shutdown_cause).
+    """
+    line_lost_time = None
+    last_valid_frame_time = clock_fn()
+    consecutive_frame_failures = 0
+    loop_count = 0
+    shutdown_cause = "NORMAL"
+
+    print("[MAIN] Starting line following loop...")
+    print("[MAIN] Press ESC to stop (or Ctrl+C)")
+
+    while not _shutdown_requested:
+        if max_iterations is not None and loop_count >= max_iterations:
+            shutdown_cause = "MAX_ITERATIONS"
+            break
+
+        current_time = clock_fn()
+
+        # 1. Capture frame
+        ret, frame = cap.read()
+
+        # Handle frame drop / camera read failure
+        if not ret or frame is None:
+            consecutive_frame_failures += 1
+            elapsed_no_frame = current_time - last_valid_frame_time
+
+            if consecutive_frame_failures == 1 or consecutive_frame_failures % config.CAMERA_MAX_CONSECUTIVE_FAILURES == 0:
+                print(f"[MAIN] WARNING: Camera frame read failed (consecutive: {consecutive_frame_failures}, "
+                      f"elapsed: {elapsed_no_frame:.2f}s)")
+
+            # Do not run line detection on invalid frame!
+            # Reset PID controller to discard any stale derivative/integral state
+            pid.reset()
+
+            # Prevent 100% CPU spinning during camera dropout
+            if config.CAMERA_RETRY_SLEEP > 0:
+                sleep_fn(config.CAMERA_RETRY_SLEEP)
+
+            # Stage 1 Camera Failure: Bounded hover response once threshold is reached
+            if elapsed_no_frame >= config.CAMERA_FRAME_TIMEOUT:
+                if fly_mode and fc:
+                    fc.send_body_velocity(vx=0, vy=0, vz=0)
+
+            # Stage 2 Camera Failure: Persistent fault timeout -> trigger landing
+            if elapsed_no_frame >= config.CAMERA_FAULT_TIMEOUT:
+                print(f"[MAIN] CRITICAL: Camera feed lost for {elapsed_no_frame:.2f}s "
+                      f"(exceeds {config.CAMERA_FAULT_TIMEOUT}s timeout). Aborting flight!")
+                shutdown_cause = "CAMERA_TIMEOUT"
+                break
+
+            # Crucial: Run safety checks on every failed frame!
+            if fly_mode and fc:
+                if not fc.check_battery():
+                    shutdown_cause, msg = _get_battery_failure_cause(fc)
+                    print(f"{msg} (during camera failure)")
+                    break
+
+                if fc.check_rc_override() or fc.is_mode_changed():
+                    print("[MAIN] Pilot override detected during camera failure! Releasing control.")
+                    shutdown_cause = "RC_OVERRIDE"
+                    if exit_on_override:
+                        fc.close()
+                        cap.release()
+                        if config.SHOW_DEBUG_FRAMES and cv2:
+                            cv2.destroyAllWindows()
+                        sys.exit(0)
+                    else:
+                        break
+
+            loop_count += 1
+            continue
+
+        # Valid frame arrived -> Reset camera failure counters
+        consecutive_frame_failures = 0
+        last_valid_frame_time = current_time
+
+        # 2. Vision processing with LineDetector
+        result = detector.detect(frame, draw_debug=config.SHOW_DEBUG_FRAMES)
+        line_detected = result.detected
+        pid_output = 0.0
+
+        if line_detected:
+            line_lost_time = None
+            pid_output = pid.compute(result.normalized_error)
+
+            if fly_mode and fc:
+                fc.send_body_velocity(
+                    vx=config.FORWARD_SPEED,
+                    vy=pid_output,
+                    vz=0
+                )
+        else:
+            # Line lost on valid frame
+            if line_lost_time is None:
+                line_lost_time = current_time
+                pid.reset()
+                print("[MAIN] Line lost! Hovering...")
+
+            lost_duration = current_time - line_lost_time
+
+            if fly_mode and fc:
+                fc.send_body_velocity(vx=0, vy=0, vz=0)
+
+            if lost_duration > config.LINE_LOST_TIMEOUT:
+                print(f"[MAIN] Line lost for {lost_duration:.1f}s — "
+                      f"exceeds {config.LINE_LOST_TIMEOUT}s timeout!")
+                shutdown_cause = "LINE_LOST_TIMEOUT"
+                break
+
+        # 3. Safety checks (battery, RC override, mode changed)
+        if fly_mode and fc:
+            if loop_count % 5 == 0:
+                if not fc.check_battery():
+                    shutdown_cause, msg = _get_battery_failure_cause(fc)
+                    print(msg)
+                    break
+
+            if fc.check_rc_override() or fc.is_mode_changed():
+                print("[MAIN] Pilot override detected! Releasing control.")
+                shutdown_cause = "RC_OVERRIDE"
+                if exit_on_override:
+                    fc.close()
+                    cap.release()
+                    if config.SHOW_DEBUG_FRAMES and cv2:
+                        cv2.destroyAllWindows()
+                    sys.exit(0)
+                else:
+                    break
+
+        # 4. Debug display
+        if config.SHOW_DEBUG_FRAMES and cv2 and result.debug_frame is not None:
+            cv2.imshow("Line Following - Camera", result.debug_frame)
+            if result.binary_mask is not None:
+                cv2.imshow("Line Following - Threshold", result.binary_mask)
+
+            if cv2.waitKey(1) == 27:
+                print("[MAIN] ESC pressed — stopping.")
+                shutdown_cause = "USER_ESC"
+                break
+
+        loop_count += 1
+
+    return {
+        "loop_count": loop_count,
+        "consecutive_frame_failures": consecutive_frame_failures,
+        "shutdown_cause": shutdown_cause
+    }
+
+
+# ==============================================================================
+# Main CLI Entry Point
 # ==============================================================================
 
 def main():
@@ -197,7 +356,11 @@ def main():
 
         print("[MAIN] Starting arm and takeoff sequence...")
         if not fc.arm_and_takeoff():
-            print("[MAIN] ERROR: Takeoff failed!")
+            status = getattr(fc, 'last_takeoff_status', 'UNKNOWN')
+            print(f"[MAIN] ERROR: Takeoff failed with status: {status}!")
+            if status == "TIMEOUT":
+                print("[MAIN] CRITICAL WARNING: Takeoff timed out after arming! Vehicle may be airborne in GUIDED mode.")
+                print("[MAIN] Telemetry connection is closing; vehicle safety depends on physical RC takeover or ArduPilot failsafe.")
             fc.close()
             cap.release()
             sys.exit(1)
@@ -206,98 +369,19 @@ def main():
         print("[MAIN] Hovering for 2 seconds to stabilize...")
         time.sleep(2)
 
-    # --- Main Control Loop ---
-    print("[MAIN] Starting line following loop...")
-    print("[MAIN] Press ESC to stop (or Ctrl+C)")
-
-    line_lost_time = None
-    loop_count = 0
-
     try:
-        while not _shutdown_requested:
-            ret, frame = cap.read()
-
-            if not ret:
-                print("[MAIN] WARNING: Frame not received, retrying...")
-                continue
-
-            # --- Vision Processing ---
-            error, cx, cy, thresh = detect_line(frame)
-
-            line_detected = error is not None
-            pid_output = 0.0
-
-            if line_detected:
-                # Line found — reset lost timer
-                line_lost_time = None
-
-                # Normalize error to roughly [-1, 1] range
-                # Use actual frame width (not config) to handle resolution differences
-                frame_half_width = frame.shape[1] / 2
-                normalized_error = error / frame_half_width
-
-                # Compute PID correction
-                pid_output = pid.compute(normalized_error)
-
-                # Send velocity command to drone
-                if fly_mode and fc:
-                    fc.send_body_velocity(
-                        vx=config.FORWARD_SPEED,   # Move forward
-                        vy=pid_output,              # Lateral correction
-                        vz=0                        # Maintain altitude
-                    )
-
-            else:
-                # Line lost
-                if line_lost_time is None:
-                    line_lost_time = time.time()
-                    pid.reset()
-                    print("[MAIN] Line lost! Hovering...")
-
-                lost_duration = time.time() - line_lost_time
-
-                if fly_mode and fc:
-                    # Hover in place while searching
-                    fc.send_body_velocity(vx=0, vy=0, vz=0)
-
-                # Check if line has been lost too long
-                if lost_duration > config.LINE_LOST_TIMEOUT:
-                    print(f"[MAIN] Line lost for {lost_duration:.1f}s — "
-                          f"exceeds {config.LINE_LOST_TIMEOUT}s timeout!")
-                    break
-
-            # --- Safety Checks (every 10th frame to reduce overhead) ---
-            if fly_mode and fc and loop_count % 10 == 0:
-                if not fc.check_battery():
-                    print("[MAIN] CRITICAL: Low battery! Emergency landing!")
-                    break
-
-                if fc.check_rc_override() or fc.is_mode_changed():
-                    print("[MAIN] Pilot override detected! Releasing control.")
-                    # Don't land automatically — pilot has control
-                    fc.close()
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    sys.exit(0)
-
-            # --- Debug Display ---
-            if config.SHOW_DEBUG_FRAMES:
-                draw_debug_overlay(frame, thresh, error, cx, cy,
-                                   pid_output, line_detected)
-                cv2.imshow("Line Following - Camera", frame)
-                cv2.imshow("Line Following - Threshold", thresh)
-
-                if cv2.waitKey(1) == 27:  # ESC key
-                    print("[MAIN] ESC pressed — stopping.")
-                    break
-
-            loop_count += 1
-
+        run_flight_loop(
+            cap=cap,
+            detector=_line_detector,
+            pid=pid,
+            fc=fc,
+            fly_mode=fly_mode,
+            exit_on_override=True
+        )
     except Exception as e:
         print(f"[MAIN] ERROR in main loop: {e}")
         import traceback
         traceback.print_exc()
-
     finally:
         # --- Clean Shutdown ---
         print("[MAIN] Shutting down...")
@@ -305,7 +389,9 @@ def main():
         if fly_mode and fc:
             print("[MAIN] Initiating landing...")
             try:
-                fc.land()
+                landed = fc.land()
+                if not landed:
+                    print("[MAIN] WARNING: Landing did not confirm disarm within timeout!")
             except Exception as e:
                 print(f"[MAIN] Landing error: {e}")
                 print("[MAIN] Attempting RTL...")
@@ -315,8 +401,10 @@ def main():
                     pass
             fc.close()
 
-        cap.release()
-        cv2.destroyAllWindows()
+        if cap is not None:
+            cap.release()
+        if cv2 is not None:
+            cv2.destroyAllWindows()
         print("[MAIN] Shutdown complete.")
 
 

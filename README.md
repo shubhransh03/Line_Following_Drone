@@ -1,170 +1,161 @@
-# 🚁 Line Following Drone
+# 🚁 Autonomous Line Following Drone
 
-An autonomous quadcopter that uses computer vision to detect and follow a line on the ground. Built with a Raspberry Pi companion computer, Pixhawk flight controller, and OpenCV.
+An autonomous quadcopter that uses onboard computer vision to detect and follow a ground line track. Designed for an onboard Raspberry Pi companion computer communicating via MAVLink with a Pixhawk flight controller running ArduPilot.
 
-## Architecture
+---
+
+## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Raspberry Pi                       │
-│                                                      │
-│  Pi Camera V4 ──► OpenCV ──► PID Controller          │
-│                  (line       (error → velocity)      │
-│                  detection)         │                 │
-│                                     ▼                │
-│                                 DroneKit             │
-│                                (MAVLink)             │
-└──────────────────────────────────┬───────────────────┘
-                                   │ Serial /dev/ttyAMA0
-                                   │ 57600 baud
-                                   ▼
-                            ┌─────────────┐
-                            │   Pixhawk   │──► 4x Motors
-                            │     FC      │
-                            └─────────────┘
-                                   ▲
-                            RC Transmitter
-                           (manual override)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Raspberry Pi 4 / Companion Computer                          │
+│                                                                             │
+│  Downard Camera ──► LineDetector (OpenCV) ──► PIDController                 │
+│  (libcamera)        (Moments, Contours,       (Cross-track Error →          │
+│                      Defensive Guards)         Lateral Velocity)            │
+│                                                       │                     │
+│  BatteryMonitor ◄── Telemetry Polling                 ▼                     │
+│  (State Machine,    (Voltage, Heartbeat,      FlightController              │
+│   Outlier Filter,    Altitude, EKF)          (Bounded Takeoff/Land,         │
+│   Hysteresis)                                 Body Velocity, Safety)        │
+│                                                       │                     │
+│                                                       ▼                     │
+│                                                   DroneKit / MAVLink        │
+└───────────────────────────────────────┬─────────────────────────────────────┘
+                                        │ Serial UART (/dev/ttyAMA0 or USB)
+                                        │ 57600 baud
+                                        ▼
+                             ┌─────────────────────┐
+                             │ Pixhawk Flight Ctrl │──► 4× Motors & ESCs
+                             │ (ArduPilot Firmware)│
+                             └─────────────────────┘
+                                        ▲
+                                 RC Transmitter
+                                (Manual Override)
 ```
 
-## Hardware Requirements
-
-| Component | Details |
-|-----------|---------|
-| Frame | S500 quadcopter |
-| Flight Controller | Pixhawk (with MS5611 barometer) |
-| Companion Computer | Raspberry Pi 4/5 |
-| Camera | Raspberry Pi Camera Module V4 |
-| Motors | 4× Brushless + 4× ESCs |
-| Battery | ~3300 mAh LiPo (3S) |
-| RC | Transmitter + Receiver |
-| Calibration | QGroundControl |
-
-## Software Requirements
-
-- Python 3.11+
-- OpenCV (`python3-opencv`)
-- DroneKit (`dronekit`)
-- PyMAVLink (`pymavlink`)
-- GStreamer (`gstreamer1.0-tools` + plugins)
-- pyserial
-- v4l-utils
+---
 
 ## Project Structure
 
 ```
-Line_Following_Drone/
-├── config.py              # All tunable parameters (PID, camera, flight, safety)
-├── pid_controller.py      # PID controller class with anti-windup
-├── flight_controller.py   # DroneKit wrapper (connect, takeoff, velocity, land)
-├── main.py                # Integrated autonomous flight script
-├── cam_test.py            # Camera test script
-├── drone_test.py          # Pixhawk connection test script
-├── line_detection.py      # Vision pipeline test script
-└── README.md              # This file
+Drones/
+├── config.py                 # Centralized configuration & environment variable overrides
+├── line_detector.py          # Unified computer vision pipeline & contour analyzer
+├── battery_monitor.py        # Robust battery telemetry state machine & noise filter
+├── pid_controller.py         # Discrete PID controller with anti-windup clamping
+├── flight_controller.py      # DroneKit MAVLink interface with bounded pre-arm & takeoff
+├── main.py                   # Integrated autonomous flight script & testable loop
+├── cam_test.py               # Camera sanity check
+├── drone_test.py             # Passive telemetry & heartbeat diagnostic
+├── line_detection.py         # Vision pipeline test wrapper
+├── raspberry_pi/             # Dedicated Raspberry Pi companion computer deployment package
+│   ├── pi_main.py            # Pi entry point (diagnostics, mock, guarded hardware)
+│   ├── camera_source.py      # Camera abstraction (OpenCV & Synthetic)
+│   ├── line_perception.py    # Enhanced vision with dual-ROI heading estimation
+│   ├── pid_controller.py     # Reusable PID controller
+│   ├── mavlink_adapter.py    # MAVLink telemetry & command abstraction
+│   ├── safety_monitor.py     # Multi-subsystem safety watchdog
+│   ├── config_loader.py      # Lightweight YAML loader & strict hardware validator
+│   ├── config.yaml           # Deployment configuration with explicit placeholders
+│   ├── requirements-pi.txt   # Pi-specific Python dependencies
+│   ├── install.sh            # Guarded Linux installation script (run on Pi only)
+│   ├── run_diagnostics.sh    # Read-only diagnostic runner
+│   ├── README.md             # Complete Pi setup and operating guide
+│   └── tests/                # 41 offline unit tests for Pi package
+├── simulation/               # Three.js 3D web-based racetrack flight simulator
+├── requirements.txt          # Production companion-computer requirements
+├── requirements-dev.txt      # Development & offline test requirements
+├── test_config.py            # Unit tests for configuration & overrides
+├── test_line_detector.py     # Deterministic unit tests for vision pipeline
+├── test_battery_monitor.py   # Unit tests for battery telemetry filtering
+├── test_camera_failure.py    # Unit tests for camera frame-drop safety
+├── test_takeoff_and_prearm.py# Unit tests for takeoff bounding & pre-arm checks
+└── test_offline_integration.py# End-to-end integration test suite
 ```
 
-## Setup (Raspberry Pi)
+---
 
-```bash
-# 1. System updates
-sudo apt update && sudo apt upgrade -y
+## Offline Testing & Verification
 
-# 2. Install system dependencies
-sudo apt install python3-opencv python3-venv v4l-utils \
-    gstreamer1.0-tools gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad -y
+The entire software pipeline can be tested deterministically offline without connecting to physical hardware, opening serial ports, or running live motors.
 
-# 3. Create virtual environment
-python3 -m venv drone_env
-source drone_env/bin/activate
+### Running All Tests
+Using the project's dedicated virtual environment (`.diag_venv`):
 
-# 4. Install Python packages
-pip install dronekit pymavlink pyserial future
+```powershell
+# Run all tests across the repository (99 tests)
+& ".\.diag_venv\Scripts\python.exe" -m unittest discover -v -p "test_*.py"
 
-# 5. Add user to dialout group (for serial access)
-sudo usermod -a -G dialout $USER
-
-# 6. Reboot
-sudo reboot
+# Or run Raspberry Pi package tests only (41 tests)
+& ".\.diag_venv\Scripts\python.exe" -m unittest discover -v -s raspberry_pi/tests -p "test_*.py"
 ```
 
-## Usage
+All 99 unit and integration tests execute in <0.6 seconds:
+- **Root Regression Suite (58 tests)**:
+  - `test_config.py`: 4 tests (zero side-effect import, environment overrides, sanity bounds)
+  - `test_line_detector.py`: 8 tests (moments, contour filtering, centering, sign convention)
+  - `test_battery_monitor.py`: 11 tests (state machine, transient dips, sustained low, hysteresis, stale detection, heartbeat link freshness)
+  - `test_camera_failure.py`: 7 tests (frame drop counters, hover timeouts, fault aborts)
+  - `test_takeoff_and_prearm.py`: 16 tests (pre-arm sensors, bounded climb, timeout non-actuation, mode/arming failures, bounded landing, disarm confirmation, armed close warning)
+  - `test_offline_integration.py`: 12 tests (full flight loop across tracking, line lost, drops, RC override, distinct LOW/STALE/UNKNOWN battery aborts)
+- **Raspberry Pi Deployment Suite (41 tests)**:
+  - `test_config_validation.py`: 8 tests (YAML parser, section validation, strict hardware gating, warning reporting)
+  - `test_camera_source.py`: 6 tests (start/stop, synthetic patterns, frame dimensions, queued drops, recovery, device error handling)
+  - `test_line_perception.py`: 7 tests (centered line, left/right sign convention, curved lookahead heading, blank frame, intersection detection, defensive guards)
+  - `test_mavlink_adapter.py`: 7 tests (telemetry snapshot, heartbeat staleness, RC override, command recording, disconnect, hardware gating)
+  - `test_safety_monitor.py`: 9 tests (nominal CONTINUE, camera hover/abort/recovery, stale telemetry abort, low battery abort, RC override, mode divergence, line loss watchdog)
+  - `test_pi_main.py`: 4 tests (diagnostics mode zero flight commands, mock autonomous loop, hardware gating rejection, takeoff failure clean teardown)
 
-### Step 1: Test the Camera
+---
 
-```bash
-python cam_test.py
-```
-Verify you see a live video feed. Press ESC to exit.
+## Safety Systems & Hardened Logic
 
-### Step 2: Test Pixhawk Connection
+1. **Pre-Arm Telemetry Guards**:
+   - Telemetry heartbeat must be fresh (<3.0s).
+   - Autopilot `is_armable` must report healthy.
+   - Relative altitude telemetry must be available.
+   - EKF status must report healthy.
+   - Initial state must be disarmed.
+   - Battery voltage must be valid and above threshold.
 
-```bash
-python drone_test.py
-```
-Verify telemetry is displayed (battery, GPS, mode, etc.).
+2. **Bounded Flight Sequences**:
+   - **Takeoff**: Bounded by `TAKEOFF_TIMEOUT` (30.0s). If target altitude is not reached, a non-actuating fault status (`TIMEOUT`) is recorded without issuing unverified flight commands.
+   - **Landing**: Bounded by `LANDING_TIMEOUT` (60.0s). Waits for vehicle touchdown and disarm with monotonic timeout to prevent infinite loops.
 
-### Step 3: Test Line Detection
+3. **Multi-Stage Camera Failure Policy**:
+   - **Dropped Frame (<1.0s)**: Reset PID derivative/integral terms, throttle CPU spin (`CAMERA_RETRY_SLEEP`), maintain altitude.
+   - **Stage 1 Timeout (`CAMERA_FRAME_TIMEOUT` = 1.0s)**: Command zero body velocity (`vx=0, vy=0, vz=0`) to hover safely in place.
+   - **Stage 2 Fault (`CAMERA_FAULT_TIMEOUT` = 3.0s)**: Abort flight loop and trigger clean landing.
+   - **Continuous Safety Checks**: RC manual override and battery monitors continue executing on every dropped frame iteration.
 
-```bash
-python line_detection.py
-```
-Point the camera at a dark line on a light surface. Verify the red centroid dot tracks the line and the error value is printed.
+4. **Battery Telemetry State Machine**:
+   - Rejects non-finite values (NaN/Inf), negative voltages, and out-of-range spikes ($<5\text{V}$ or $>26\text{V}$).
+   - Filters out transient motor voltage sags by requiring `BATTERY_LOW_CONSECUTIVE_COUNT` (3) sustained low readings before triggering `LOW`.
+   - Requires hysteresis margin (`BATTERY_HYSTERESIS_VOLTAGE` = 0.3V) above threshold before recovering to `NORMAL`.
+   - Transitions to `STALE` if telemetry packets cease for $>3.0\text{s}$.
 
-### Step 4: Vision-Only Mode (No Drone)
+5. **Pilot Manual Override**:
+   - Monitored continuously via RC channel PWM threshold (`RC_OVERRIDE_PWM_THRESHOLD` = 1800) and autopilot mode changes away from `GUIDED`.
 
-```bash
-python main.py --no-fly
-```
-Runs the full vision + PID pipeline without connecting to the drone. Useful for tuning the threshold and PID gains before real flight.
+---
 
-### Step 5: Autonomous Flight
+## Simulation vs. Real Flight Architecture Note
 
-> ⚠️ **WARNING**: Ensure you are in a safe, open area. Keep the RC transmitter ready for manual override.
+In `simulation/app.js`, the drone simulator uses track-spline tangent vectors directly from the 3D world (`this.trackHeading`) to smoothly turn the drone's yaw heading along curves.
 
-```bash
-python main.py
-```
+On the real physical quadcopter:
+- The flight controller currently commands body velocities $v_x$ (forward) and $v_y$ (lateral error correction) with fixed yaw ($\omega_z = 0$).
+- For straight lines, this follows the line accurately.
+- For curves and closed-loop tracks, the physical drone will drift sideways ("crab") unless yaw rotation is actively commanded.
+- **Path Forward**: Use `LineDetector.detect().angle` (the orientation angle of the line contour in the camera frame) fed into a dedicated Yaw Rate PID controller to unmask and command angular rate $\omega_z$ in MAVLink `set_position_target_local_ned_encode`.
 
-The drone will:
-1. Connect to Pixhawk
-2. Arm and takeoff to the configured altitude
-3. Follow the detected line using PID-controlled velocity commands
-4. Land automatically if the line is lost for too long
-5. Emergency land on low battery
+---
 
-## Configuration
+## Live Hardware Pre-Flight Safety Protocol
 
-All parameters are in `config.py`:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `TARGET_ALTITUDE` | 2.0 m | Takeoff altitude |
-| `FORWARD_SPEED` | 0.3 m/s | Forward velocity during line following |
-| `MAX_LATERAL_SPEED` | 0.5 m/s | Maximum lateral correction speed |
-| `PID_KP` | 0.3 | Proportional gain |
-| `PID_KI` | 0.0 | Integral gain |
-| `PID_KD` | 0.1 | Derivative gain |
-| `THRESHOLD_VALUE` | 60 | Binary threshold for line detection |
-| `MIN_CONTOUR_AREA` | 500 | Minimum contour area (noise filter) |
-| `LINE_LOST_TIMEOUT` | 3.0 s | Land if line lost for this long |
-| `LOW_BATTERY_VOLTAGE` | 10.5 V | Emergency land threshold |
-
-## PID Tuning Guide
-
-1. Start with `Kp=0.3, Ki=0, Kd=0` in `--no-fly` mode
-2. Watch the PID output on screen — it should respond proportionally to error
-3. Increase `Kp` until the output oscillates, then reduce by ~30%
-4. Add `Kd=0.1` to dampen oscillations
-5. Only add `Ki` if there's persistent steady-state error (start very small: 0.01)
-6. Test in flight at low altitude (2m) with very slow forward speed (0.2 m/s)
-
-## Safety Features
-
-- **Low Battery**: Automatically lands when voltage drops below threshold
-- **Line Lost Timeout**: Hovers then lands if line is lost for too long
-- **RC Override**: Detects when pilot takes manual control via RC switch
-- **Mode Change Detection**: Stops autonomous control if mode changes externally
-- **Ctrl+C Handling**: Clean shutdown with guaranteed landing sequence
-- **Fallback Landing**: Attempts RTL if normal landing fails
+When bench testing with physical hardware:
+1. **PROPELLERS MUST BE REMOVED** at all times during bench testing and calibration.
+2. Ensure the vehicle remains disarmed until field-ready.
+3. Telemetry connection port can be set via `DRONE_CONNECTION_STRING` (e.g. `COM11` on Windows or `/dev/ttyAMA0` on Linux).
+4. Always test RC manual override switch prior to flight.

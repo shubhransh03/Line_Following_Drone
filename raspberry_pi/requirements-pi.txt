@@ -1,0 +1,28 @@
+# ==============================================================================
+# Autonomous Line-Following Drone — Raspberry Pi Python Dependencies
+# ==============================================================================
+# Target Platform: Raspberry Pi 4B / 5 running Raspberry Pi OS (Debian 64-bit)
+# Recommended Python: Python 3.9, 3.10, or 3.11
+#
+# NOTE ON SYSTEM PACKAGES:
+# On Raspberry Pi OS (Debian Bookworm / Bullseye), OpenCV and NumPy are best
+# installed via apt to ensure hardware acceleration and camera stack compatibility:
+#   sudo apt update
+#   sudo apt install -y python3-opencv python3-numpy python3-yaml python3-serial python3-venv
+#
+# The packages below are installed in the Pi virtual environment:
+# ==============================================================================
+
+# Autopilot Communication & Telemetry
+pymavlink>=2.4.40
+pyserial>=3.5
+
+# YAML Configuration Parser
+PyYAML>=6.0
+
+# Numerical Processing (if not provided by system apt)
+numpy>=1.24.0
+
+# Optional DroneKit wrapper for ArduPilot
+# Note: On Python 3.11+, collections.MutableMapping compatibility shim is handled in code.
+dronekit>=2.9.2; python_version < '3.11'

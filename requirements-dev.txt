@@ -1,0 +1,11 @@
+# Offline Development & Testing Dependencies (Windows / macOS / Linux)
+#
+# Install with: pip install -r requirements-dev.txt
+#
+# Provides all dependencies needed to run the 49 offline unit/integration
+# tests, simulation tools, and vision algorithms without live hardware.
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyserial>=3.5
+pymavlink>=2.4.0
