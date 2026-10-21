@@ -11,6 +11,12 @@ Provides high-level flight operations on top of DroneKit:
 
 import time
 import sys
+import collections
+import collections.abc
+
+# Compatibility shim for Python 3.10+ where collections.MutableMapping moved to collections.abc
+if not hasattr(collections, "MutableMapping"):
+    collections.MutableMapping = collections.abc.MutableMapping
 
 from dronekit import connect, VehicleMode
 from pymavlink import mavutil
